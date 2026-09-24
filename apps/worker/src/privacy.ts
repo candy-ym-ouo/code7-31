@@ -16,6 +16,12 @@ export type ProcessedImage = {
   perceptualHash: string;
   detectorRegions: PrivacyRegion[];
   manualRegions: PrivacyRegion[];
+  /**
+   * 检测器已配置但调用失败（超时、不可达、非法响应）时的降级原因。
+   * 为 null 表示检测器未配置或调用成功。非 null 时媒体必须进入人工复核，
+   * 不得自动发布（项目文档 §6.3、验收场景 A14）。
+   */
+  detectorDegraded: string | null;
 };
 
 async function detectRegions(buffer: Buffer): Promise<PrivacyRegion[]> {
@@ -24,13 +30,25 @@ async function detectRegions(buffer: Buffer): Promise<PrivacyRegion[]> {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ imageBase64: buffer.toString("base64") }),
-    signal: AbortSignal.timeout(20_000)
+    signal: AbortSignal.timeout(config.PRIVACY_DETECTOR_TIMEOUT_MS)
   });
   if (!response.ok) throw new Error(`Privacy detector failed with ${response.status}`);
   const payload = await response.json() as DetectorResponse;
   const parsed = privacyRegionSchema.array().max(100).safeParse(payload.regions ?? []);
   if (!parsed.success) throw new Error(`Privacy detector returned invalid regions: ${parsed.error.issues[0]?.message ?? "unknown"}`);
   return parsed.data;
+}
+
+/**
+ * 处理完成后的媒体状态决策：只有检测器已配置且本次调用成功时才允许 ready；
+ * 检测器未配置或已降级（超时、不可用、非法响应）一律进入人工复核。
+ */
+export function resolveMediaStatusAfterProcessing(input: {
+  detectorConfigured: boolean;
+  detectorDegraded: string | null;
+}): "ready" | "manual_review" {
+  if (!input.detectorConfigured || input.detectorDegraded) return "manual_review";
+  return "ready";
 }
 
 function clamp(value: number, minimum: number, maximum: number): number {
@@ -84,7 +102,16 @@ export async function processPrivacyImage(source: Buffer, manualRegions: Privacy
     throw new Error("Image exceeds the configured pixel limit");
   }
 
-  const detectorRegions = await detectRegions(normalized.data);
+  let detectorRegions: PrivacyRegion[] = [];
+  let detectorDegraded: string | null = null;
+  try {
+    detectorRegions = await detectRegions(normalized.data);
+  } catch (error) {
+    // 检测器超时或不可用不得让媒体直接失败：降级为仅人工框处理，
+    // 由媒体任务把结果转入 manual_review，绝不自动公开。
+    detectorDegraded = error instanceof Error ? error.message.slice(0, 300) : "Privacy detector unavailable";
+    console.warn({ error: detectorDegraded }, "privacy detector degraded, falling back to manual review");
+  }
   const regions = [...manualRegions, ...detectorRegions].map(sanitizeRegion).map(expandRegion);
   const composites = [];
 
@@ -120,6 +147,7 @@ export async function processPrivacyImage(source: Buffer, manualRegions: Privacy
     sha256: createHash("sha256").update(image).digest("hex"),
     perceptualHash: averageHash(hashInput),
     detectorRegions,
-    manualRegions
+    manualRegions,
+    detectorDegraded
   };
 }

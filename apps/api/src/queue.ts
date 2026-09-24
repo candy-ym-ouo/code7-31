@@ -24,6 +24,8 @@ export async function enqueueMediaProcessing(mediaId: string, jobId: string): Pr
   await withTimeout(
     mediaQueue.add("process", { mediaId }, {
       jobId,
+      attempts: 3,
+      backoff: { type: "exponential", delay: 30_000 },
       removeOnComplete: 1000,
       removeOnFail: 1000
     }),

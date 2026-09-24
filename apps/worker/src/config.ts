@@ -7,6 +7,7 @@ import { z } from "zod";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+  APP_ORIGIN: z.string().url().default("http://localhost:5173"),
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().min(1).default("redis://localhost:6379/0"),
   S3_ENDPOINT: z.string().url(),
@@ -18,6 +19,7 @@ const envSchema = z.object({
   S3_PUBLIC_BUCKET: z.string().min(1),
   MEDIA_MAX_PIXELS: z.coerce.number().int().positive().default(20_000_000),
   PRIVACY_DETECTOR_URL: z.string().url().optional().or(z.literal("")),
+  PRIVACY_DETECTOR_TIMEOUT_MS: z.coerce.number().int().positive().default(20_000),
   PRIVACY_BLUR_SIGMA: z.coerce.number().positive().default(32),
   PRIVACY_BLUR_PADDING: z.coerce.number().min(0).max(0.5).default(0.08),
   ORIGINAL_RETENTION_HOURS: z.coerce.number().positive().default(24),

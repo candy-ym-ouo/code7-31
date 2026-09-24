@@ -68,6 +68,23 @@ function removeRegion(index: number) {
   regions.value.splice(index, 1);
 }
 
+async function pollStatus(id: string) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    const result = await apiFetch<MediaResult>(`/media/${id}`);
+    media.value = result;
+    status.value = result.status;
+    if (["ready", "manual_review", "failed", "rejected"].includes(result.status)) {
+      emit("processed", result);
+      if (result.status === "failed" || result.status === "rejected") {
+        error.value = "服务端处理失败，可重试处理或删除后重新上传。";
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error("处理超时，请稍后刷新媒体状态");
+}
+
 async function processImage() {
   if (!rightsConfirmed.value) {
     error.value = "请先确认你拥有图片使用权并已完成隐私检查。";
@@ -96,23 +113,25 @@ async function processImage() {
         rightsConfirmed: true
       }
     });
-
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const result = await apiFetch<MediaResult>(`/media/${init.id}`);
-      media.value = result;
-      status.value = result.status;
-      if (["ready", "manual_review", "failed", "rejected"].includes(result.status)) {
-        emit("processed", result);
-        if (result.status === "failed" || result.status === "rejected") {
-          error.value = "服务端处理失败，请删除后重新上传。";
-        }
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-    throw new Error("处理超时，请稍后刷新媒体状态");
+    await pollStatus(init.id);
   } catch (cause) {
     error.value = cause instanceof Error ? cause.message : "图片处理失败";
+    status.value = "失败";
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function retryProcessing() {
+  if (!media.value) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    await apiFetch(`/media/${media.value.id}/retry`, { method: "POST" });
+    status.value = "重新处理中…";
+    await pollStatus(media.value.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "重试失败";
     status.value = "失败";
   } finally {
     busy.value = false;
@@ -158,6 +177,15 @@ onBeforeUnmount(() => URL.revokeObjectURL(previewUrl));
     <div class="inline" style="margin-top: 10px">
       <button class="button" type="button" :disabled="busy || Boolean(media)" @click="processImage">
         {{ busy ? "处理中…" : "上传并由服务端处理" }}
+      </button>
+      <button
+        v-if="media && (media.status === 'failed' || media.status === 'rejected')"
+        class="button secondary"
+        type="button"
+        :disabled="busy"
+        @click="retryProcessing"
+      >
+        重试处理
       </button>
       <span v-if="media?.status === 'manual_review'" class="badge pending">等待审核员确认隐私处理</span>
       <span v-if="media?.status === 'ready'" class="badge">隐私处理通过</span>

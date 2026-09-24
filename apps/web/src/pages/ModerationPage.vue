@@ -16,7 +16,7 @@ type MediaItem = {
   id: string;
   original_filename: string;
   privacy_status: string;
-  privacy_report: { manualRegions?: unknown[]; detectorConfigured?: boolean };
+  privacy_report: { manualRegions?: unknown[]; detectorConfigured?: boolean; detectorDegraded?: boolean };
   processed_object_key: string | null;
   created_at: string;
   owner_name: string;
@@ -101,6 +101,19 @@ async function approveMedia(id: string) {
   }
 }
 
+async function rejectMedia(id: string) {
+  const reasonCode = window.prompt("拒绝原因码，例如 UNBLURRED_PRIVACY、PERSONAL_INFORMATION") ?? "";
+  if (!reasonCode) return;
+  const notes = window.prompt("审核备注（可选）") ?? undefined;
+  try {
+    await apiFetch(`/media/${id}/privacy-reject`, { method: "POST", body: { reasonCode, notes } });
+    notice.value = "媒体已被拒绝，上传者已收到通知。";
+    await load();
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "媒体拒绝失败";
+  }
+}
+
 async function resolveReport(id: string) {
   const actionRaw = window.prompt("处理动作：none、hide、restore", "none") ?? "none";
   const statusRaw = window.prompt("处理结果：resolved 或 dismissed", actionRaw === "none" ? "dismissed" : "resolved") ?? "dismissed";
@@ -169,11 +182,13 @@ onMounted(load);
       <article v-for="item in queue.media" :key="item.id" class="card"><div class="card-body">
         <h3>{{ item.original_filename }}</h3>
         <p class="muted">上传者：{{ item.owner_name }} · 人工框选 {{ item.privacy_report.manualRegions?.length ?? 0 }} 个区域</p>
+        <p v-if="item.privacy_report.detectorDegraded" class="notice-box">自动检测器调用失败，已降级为仅人工框处理，请重点复核敏感区域。</p>
         <p class="notice-box">自动检测器{{ item.privacy_report.detectorConfigured ? "已启用" : "未启用" }}。服务端已应用人工框选，仍需审核员确认。</p>
         <img v-if="previews[item.id]" :src="previews[item.id]" alt="隐私处理结果预览" style="width:100%; border-radius:12px" />
         <div class="inline" style="margin-top: 12px">
           <button class="button secondary" @click="loadPreview(item)">生成 10 分钟预览</button>
           <button class="button" @click="approveMedia(item.id)">确认隐私并发布媒体</button>
+          <button class="button danger" @click="rejectMedia(item.id)">拒绝媒体</button>
         </div>
       </div></article>
       <div v-if="!queue.media.length" class="card empty">没有待确认媒体。</div>

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { mediaUploadCompleteSchema, mediaUploadInitSchema } from "@map/shared/contracts";
+import { mediaUploadCompleteSchema, mediaUploadInitSchema, moderationDecisionSchema } from "@map/shared/contracts";
 import { config } from "../config";
 import { query, transaction } from "../db";
 import { AppError, conflict, forbidden, notFound } from "../errors";
@@ -16,6 +16,7 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import { notifyUser } from "../notifications";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -160,7 +161,7 @@ export async function mediaRoutes(app: FastifyInstance) {
     const row = result.rows[0];
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
-    if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
+    if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed or rejected media can be retried");
     await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
     try {
       await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
@@ -199,13 +200,14 @@ export async function mediaRoutes(app: FastifyInstance) {
     const params = z.object({ id: z.string().uuid() }).parse(request.params);
     const result = await query<{
       id: string;
+      owner_id: string;
       privacy_status: string;
       processed_object_key: string | null;
       thumbnail_object_key: string | null;
       public_object_key: string | null;
       public_thumbnail_object_key: string | null;
     }>(
-      `SELECT id, privacy_status, processed_object_key, thumbnail_object_key,
+      `SELECT id, owner_id, privacy_status, processed_object_key, thumbnail_object_key,
               public_object_key, public_thumbnail_object_key
        FROM media_assets WHERE id = $1 AND deleted_at IS NULL`,
       [params.id]
@@ -236,6 +238,13 @@ export async function mediaRoutes(app: FastifyInstance) {
           resourceType: "media",
           resourceId: params.id
         });
+        await notifyUser(client, {
+          userId: media.owner_id,
+          type: "media_privacy_approved",
+          title: "你的图片已通过隐私确认",
+          body: "审核员已确认隐私处理，图片现在可以随投稿公开发布。",
+          link: "/me/contributions"
+        });
       });
     } catch (error) {
       await Promise.allSettled([
@@ -246,6 +255,56 @@ export async function mediaRoutes(app: FastifyInstance) {
     }
 
     return { status: "ready", url: publicMediaUrl(publicKey), thumbnailUrl: media.thumbnail_object_key ? publicMediaUrl(thumbnailKey) : null };
+  });
+
+  app.post("/media/:id/privacy-reject", { preHandler: requireModerator }, async (request) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const input = moderationDecisionSchema.parse(request.body);
+    const existing = await query<{ owner_id: string; privacy_status: string }>(
+      "SELECT owner_id, privacy_status FROM media_assets WHERE id = $1 AND deleted_at IS NULL",
+      [params.id]
+    );
+    const media = existing.rows[0];
+    if (!media) throw notFound("Media not found");
+    if (media.privacy_status !== "manual_review") {
+      throw conflict("Media is not waiting for manual privacy approval");
+    }
+
+    await transaction(async (client) => {
+      const updated = await client.query(
+        `UPDATE media_assets
+         SET privacy_status = 'rejected',
+             privacy_report = jsonb_set(COALESCE(privacy_report, '{}'::jsonb), '{rejection}', $2::jsonb),
+             delete_after = now() + interval '7 days',
+             updated_at = now()
+         WHERE id = $1 AND privacy_status = 'manual_review' AND deleted_at IS NULL`,
+        [
+          params.id,
+          JSON.stringify({
+            reasonCode: input.reasonCode,
+            notes: input.notes ?? null,
+            reviewerId: request.user!.id,
+            rejectedAt: new Date().toISOString()
+          })
+        ]
+      );
+      if (!updated.rowCount) throw conflict("Media is not waiting for manual privacy approval");
+      await recordAudit(client, {
+        actorId: request.user!.id,
+        action: "media.privacy_rejected",
+        resourceType: "media",
+        resourceId: params.id,
+        metadata: { reasonCode: input.reasonCode, notes: input.notes }
+      });
+      await notifyUser(client, {
+        userId: media.owner_id,
+        type: "media_privacy_rejected",
+        title: "你的图片未通过隐私复核",
+        body: `原因：${input.reasonCode}${input.notes ? `。${input.notes}` : ""}。请删除后重新上传，并完整框选人脸、车牌等敏感区域。`,
+        link: "/me/contributions"
+      });
+    });
+    return { status: "rejected" };
   });
 
   app.delete("/media/:id", { preHandler: requireAuth }, async (request) => {

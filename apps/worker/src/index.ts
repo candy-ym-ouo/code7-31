@@ -20,9 +20,16 @@ for (const [name, connection] of [
 }
 const mediaQueue = new Queue("media", { connection: queueConnection });
 
+/** 媒体任务统一重试策略：瞬时故障自动重试，耗尽后由任务本身落 failed 并通知用户。 */
+const MEDIA_JOB_ATTEMPTS = 3;
+const MEDIA_JOB_BACKOFF = { type: "exponential", delay: 30_000 } as const;
+
 const mediaWorker = new Worker("media", async (job) => {
   if (job.name !== "process") return;
-  await processMediaJob(String(job.data.mediaId));
+  await processMediaJob(String(job.data.mediaId), {
+    attempt: job.attemptsMade + 1,
+    maxAttempts: job.opts.attempts ?? MEDIA_JOB_ATTEMPTS
+  });
 }, { connection: mediaWorkerConnection, concurrency: 2 });
 
 const outboxWorker = new Worker("outbox", async (job) => {
@@ -54,6 +61,8 @@ async function maintenanceTick() {
     for (const mediaId of stuckMedia) {
       await withTimeout(mediaQueue.add("process", { mediaId }, {
         jobId: `media-recover-${mediaId}-${Date.now()}`,
+        attempts: MEDIA_JOB_ATTEMPTS,
+        backoff: MEDIA_JOB_BACKOFF,
         removeOnComplete: 1000,
         removeOnFail: 1000
       }), 3_000);

@@ -3,16 +3,25 @@ import { config } from "./config";
 import { pool } from "./db";
 import { deleteObject, objectExists, readQuarantineObject, writeQuarantineObject, copyToPublic } from "./storage";
 import { scanForMalware } from "./clamav";
-import { processPrivacyImage } from "./privacy";
+import { processPrivacyImage, resolveMediaStatusAfterProcessing } from "./privacy";
+import { notifyUser } from "./notify";
 
-export async function processMediaJob(mediaId: string): Promise<void> {
+export type MediaJobAttempt = {
+  /** 当前第几次尝试（从 1 开始） */
+  attempt: number;
+  /** BullMQ 配置的最大尝试次数 */
+  maxAttempts: number;
+};
+
+export async function processMediaJob(mediaId: string, attempt: MediaJobAttempt = { attempt: 1, maxAttempts: 1 }): Promise<void> {
   const result = await pool.query<{
     id: string;
+    owner_id: string;
     privacy_status: string;
     quarantine_object_key: string;
     privacy_report: { manualRegions?: PrivacyRegion[] } | null;
   }>(
-    `SELECT id, privacy_status, quarantine_object_key, privacy_report
+    `SELECT id, owner_id, privacy_status, quarantine_object_key, privacy_report
      FROM media_assets WHERE id = $1 AND deleted_at IS NULL`,
     [mediaId]
   );
@@ -23,7 +32,7 @@ export async function processMediaJob(mediaId: string): Promise<void> {
     return;
   }
 
-  const autoPublish = Boolean(config.PRIVACY_DETECTOR_URL);
+  const detectorConfigured = Boolean(config.PRIVACY_DETECTOR_URL);
   const publicKey = `media/${mediaId}.webp`;
   const publicThumbnailKey = `media/${mediaId}.thumb.webp`;
 
@@ -35,6 +44,13 @@ export async function processMediaJob(mediaId: string): Promise<void> {
     await pool.query("UPDATE media_assets SET privacy_status = 'processing', updated_at = now() WHERE id = $1", [mediaId]);
     const manualRegions = media.privacy_report?.manualRegions ?? [];
     const processed = await processPrivacyImage(source, manualRegions);
+
+    // 检测器超时或不可用时降级：仅用人工框完成处理并转入人工复核，绝不自动公开。
+    const nextStatus = resolveMediaStatusAfterProcessing({
+      detectorConfigured,
+      detectorDegraded: processed.detectorDegraded
+    });
+    const autoPublish = nextStatus === "ready";
 
     const processedKey = `processed/${mediaId}.webp`;
     const thumbnailKey = `processed/${mediaId}.thumb.webp`;
@@ -49,7 +65,9 @@ export async function processMediaJob(mediaId: string): Promise<void> {
     const report = {
       manualRegions: processed.manualRegions,
       detectorRegions: processed.detectorRegions,
-      detectorConfigured: autoPublish,
+      detectorConfigured,
+      detectorDegraded: processed.detectorDegraded !== null,
+      detectorError: processed.detectorDegraded,
       originalMetadataRemoved: true,
       serverReencoded: true,
       width: processed.width,
@@ -78,7 +96,7 @@ export async function processMediaJob(mediaId: string): Promise<void> {
        WHERE id = $1`,
       [
         mediaId,
-        autoPublish ? "ready" : "manual_review",
+        nextStatus,
         processedKey,
         thumbnailKey,
         autoPublish ? publicKey : null,
@@ -92,21 +110,36 @@ export async function processMediaJob(mediaId: string): Promise<void> {
       ]
     );
 
-    console.log(`media ${mediaId} processed as ${autoPublish ? "ready" : "manual_review"}`);
+    console.log(`media ${mediaId} processed as ${nextStatus}`);
   } catch (error) {
     const message = error instanceof Error ? error.message.slice(0, 500) : "Unknown media processing error";
+    // BullMQ 还会自动重试时保持 processing 可重入；重试耗尽才落 failed 并通知用户。
+    const willRetry = attempt.attempt < attempt.maxAttempts;
     await pool.query(
       `UPDATE media_assets
-       SET privacy_status = 'failed', failure_code = $2,
+       SET privacy_status = $2, failure_code = $3,
            delete_after = now() + interval '7 days', updated_at = now()
        WHERE id = $1`,
-      [mediaId, message]
+      [mediaId, willRetry ? "processing" : "failed", message]
     );
-    if (autoPublish) {
+    if (detectorConfigured) {
       await Promise.allSettled([
         deleteObject(config.S3_PUBLIC_BUCKET, publicKey),
         deleteObject(config.S3_PUBLIC_BUCKET, publicThumbnailKey)
       ]);
+    }
+    if (!willRetry) {
+      try {
+        await notifyUser({
+          userId: media.owner_id,
+          type: "media_processing_failed",
+          title: "你的图片隐私处理失败",
+          body: "服务端多次处理仍未成功。你可以在投稿页重试处理，或删除后重新上传。",
+          link: "/me/contributions"
+        });
+      } catch (notifyError) {
+        console.error({ mediaId, notifyError }, "failed to notify media processing failure");
+      }
     }
     throw error;
   }
