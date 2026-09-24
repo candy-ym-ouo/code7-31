@@ -59,7 +59,8 @@
 | `GET` | `/media/:id` | 查询处理状态 |
 | `GET` | `/media/:id/preview` | 审核员获取短期私有预览 |
 | `POST` | `/media/:id/privacy-approve` | 审核员确认隐私并发布派生图 |
-| `POST` | `/media/:id/retry` | 重试失败处理 |
+| `POST` | `/media/:id/privacy-reject` | 审核员拒绝隐私复核（退回上传者并通知，删除私有派生图） |
+| `POST` | `/media/:id/retry` | 重试失败或被拒绝的处理（重置尝试计数） |
 | `DELETE` | `/media/:id` | 删除媒体对象 |
 
 ## 评论、举报和通知

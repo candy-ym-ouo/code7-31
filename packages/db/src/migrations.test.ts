@@ -28,6 +28,15 @@ describe("initial migration", () => {
     expect(followup).toContain("updated_at timestamptz");
   });
 
+  it("tracks bounded media processing attempts for recovery in migration 0003", () => {
+    const recovery = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), "../migrations/0003_media_recovery.sql"),
+      "utf8"
+    );
+    expect(recovery).toContain("processing_attempts");
+    expect(recovery).toMatch(/ADD COLUMN processing_attempts/);
+  });
+
   it("uses PostGIS geography points and spatial indexes", () => {
     expect(migration).toContain("geography(Point, 4326)");
     expect(migration).toContain("USING gist (geom)");

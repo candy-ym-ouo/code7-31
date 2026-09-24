@@ -20,8 +20,10 @@ function serializeMedia(media: MediaRow[] | null | undefined) {
   return (media ?? []).map((item) => ({
     id: item.id,
     status: item.privacy_status,
-    url: publicMediaUrl(item.public_object_key),
-    thumbnailUrl: publicMediaUrl(item.public_thumbnail_object_key)
+    // Defense in depth: never emit a public URL for media that has not cleared
+    // the privacy gate, even if a stale object key is present.
+    url: item.privacy_status === "ready" ? publicMediaUrl(item.public_object_key) : null,
+    thumbnailUrl: item.privacy_status === "ready" ? publicMediaUrl(item.public_thumbnail_object_key) : null
   }));
 }
 

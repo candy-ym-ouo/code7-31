@@ -87,8 +87,19 @@ async function processImage() {
     });
     status.value = "上传到私有隔离区…";
     await uploadFile(init.uploadUrl, props.file);
-    status.value = "服务端处理隐私模糊…";
-    await apiFetch(`/media/uploads/${init.id}/complete`, {
+    await completeUpload(init.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "图片处理失败";
+    status.value = "失败";
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function completeUpload(mediaId: string) {
+  status.value = "服务端处理隐私模糊…";
+  try {
+    await apiFetch(`/media/uploads/${mediaId}/complete`, {
       method: "POST",
       body: {
         privacyRegions: regions.value,
@@ -96,23 +107,43 @@ async function processImage() {
         rightsConfirmed: true
       }
     });
-
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const result = await apiFetch<MediaResult>(`/media/${init.id}`);
-      media.value = result;
-      status.value = result.status;
-      if (["ready", "manual_review", "failed", "rejected"].includes(result.status)) {
-        emit("processed", result);
-        if (result.status === "failed" || result.status === "rejected") {
-          error.value = "服务端处理失败，请删除后重新上传。";
-        }
-        return;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-    }
-    throw new Error("处理超时，请稍后刷新媒体状态");
   } catch (cause) {
-    error.value = cause instanceof Error ? cause.message : "图片处理失败";
+    // Queue unavailable: the server keeps the asset recoverable and processes it
+    // automatically. Keep polling rather than telling the user it failed.
+    status.value = "处理队列繁忙，等待自动重试…";
+  }
+  await pollUntilSettled(mediaId);
+}
+
+async function pollUntilSettled(mediaId: string) {
+  for (let attempt = 0; attempt < 90; attempt += 1) {
+    const result = await apiFetch<MediaResult>(`/media/${mediaId}`);
+    media.value = result;
+    status.value = result.status;
+    if (["ready", "manual_review", "failed", "rejected"].includes(result.status)) {
+      emit("processed", result);
+      if (result.status === "failed" || result.status === "rejected") {
+        error.value = result.status === "rejected"
+          ? "照片未通过人工隐私复核，可调整隐私框选后重试。"
+          : "服务端处理失败，可点击重试，或删除后重新上传。";
+      }
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error("处理仍在进行，请稍后在投稿页刷新媒体状态");
+}
+
+async function retryMedia() {
+  if (!media.value) return;
+  busy.value = true;
+  error.value = "";
+  status.value = "重新提交处理…";
+  try {
+    await apiFetch(`/media/${media.value.id}/retry`, { method: "POST" });
+    await pollUntilSettled(media.value.id);
+  } catch (cause) {
+    error.value = cause instanceof Error ? cause.message : "重试失败";
     status.value = "失败";
   } finally {
     busy.value = false;
@@ -156,10 +187,13 @@ onBeforeUnmount(() => URL.revokeObjectURL(previewUrl));
     <label class="inline"><input v-model="rightsConfirmed" type="checkbox" /> 我拥有图片使用权，并确认需要处理的隐私区域</label>
     <p v-if="error" class="error-box">{{ error }}</p>
     <div class="inline" style="margin-top: 10px">
-      <button class="button" type="button" :disabled="busy || Boolean(media)" @click="processImage">
+      <button class="button" type="button" :disabled="busy || (media !== null && !['failed', 'rejected'].includes(media.status))" @click="processImage">
         {{ busy ? "处理中…" : "上传并由服务端处理" }}
       </button>
-      <span v-if="media?.status === 'manual_review'" class="badge pending">等待审核员确认隐私处理</span>
+      <button v-if="['failed', 'rejected'].includes(media?.status ?? '')" class="button secondary" type="button" :disabled="busy" @click="retryMedia">
+        重试处理
+      </button>
+      <span v-if="media?.status === 'manual_review'" class="badge pending">等待审核员确认隐私处理（检测器不可用时也会进入此状态）</span>
       <span v-if="media?.status === 'ready'" class="badge">隐私处理通过</span>
     </div>
   </article>

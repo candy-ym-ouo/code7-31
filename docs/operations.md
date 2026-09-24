@@ -14,8 +14,10 @@
 - API 错误率、p50/p95/p99 延迟。
 - PostgreSQL 连接数、慢查询和磁盘使用率。
 - Redis 内存、BullMQ 等待任务和失败任务。
-- `media_assets` 中 `processing` 或 `failed` 数量。
-- `manual_review` 媒体队列长度。
+- `media_assets` 中 `processing` 或 `failed` 数量，以及 `processing_attempts` 的分布。
+- `manual_review` 媒体队列长度；`privacy_report.detector = 'degraded'` 的数量表示隐私检测器正在降级。
+- 检测器降级事件（审计动作 `media.privacy_degraded_to_manual_review`）和站内通知 `media_detector_degraded`；持续出现说明检测器不可用，应先排查检测器而不是放行媒体。
+- `failure_code = 'QUEUE_UNAVAILABLE_PENDING_RECOVERY'` 的媒体数量（API 入队失败、等待 Worker 补入队）。
 - `pending` 内容与评论队列长度。
 - outbox `pending`、`failed` 数量。
 - `delete_after <= now()` 的原图数量。

@@ -12,6 +12,8 @@ beforeAll(async () => {
   process.env.S3_QUARANTINE_BUCKET = "quarantine";
   process.env.S3_PUBLIC_BUCKET = "public";
   process.env.PRIVACY_DETECTOR_URL = "";
+  process.env.PRIVACY_DETECTOR_RETRIES = "1";
+  process.env.PRIVACY_DETECTOR_RETRY_BASE_MS = "1";
   const module = await import("./privacy");
   processPrivacyImage = module.processPrivacyImage;
 });
@@ -42,4 +44,24 @@ describe("privacy image processing", () => {
     expect(result.thumbnail.length).toBeGreaterThan(0);
     expect(difference).toBeGreaterThan(500);
   });
+
+  it("reports a degraded detector outcome when no detector is configured", async () => {
+    const source = await sharp({
+      create: { width: 64, height: 64, channels: 3, background: { r: 10, g: 20, b: 30 } }
+    }).png().toBuffer();
+
+    const result = await processPrivacyImage(source, []);
+    expect(result.detector.status).toBe("degraded");
+    expect(result.detectorRegions).toEqual([]);
+  });
+
+  it("rejects unsupported image formats with a permanent error", async () => {
+    const source = Buffer.from("this is not an image");
+    await expect(processPrivacyImage(source, [])).rejects.toMatchObject({
+      name: "MediaProcessingError",
+      code: "UNSUPPORTED_FORMAT",
+      kind: "permanent"
+    });
+  });
 });
+

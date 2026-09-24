@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
-import { mediaUploadCompleteSchema, mediaUploadInitSchema } from "@map/shared/contracts";
+import { mediaUploadCompleteSchema, mediaUploadInitSchema, moderationDecisionSchema } from "@map/shared/contracts";
 import { config } from "../config";
 import { query, transaction } from "../db";
 import { AppError, conflict, forbidden, notFound } from "../errors";
@@ -16,6 +16,7 @@ import {
 } from "../storage";
 import { enqueueMediaProcessing } from "../queue";
 import { recordAudit } from "../audit";
+import { notifyUser } from "../notifications";
 
 function extensionForMime(mime: string) {
   if (mime === "image/jpeg") return "jpg";
@@ -124,11 +125,14 @@ export async function mediaRoutes(app: FastifyInstance) {
     try {
       await enqueueMediaProcessing(params.id, `media-${params.id}`);
     } catch (error) {
+      // The queue is briefly unavailable. Leave the row in "processing": the
+      // worker watchdog claims stuck processing rows and re-enqueues them, so a
+      // Redis hiccup never permanently fails an otherwise valid upload.
       await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+        "UPDATE media_assets SET failure_code = 'QUEUE_UNAVAILABLE_PENDING_RECOVERY', updated_at = now() WHERE id = $1",
         [params.id]
       );
-      throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
+      throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Processing will start automatically shortly.");
     }
     return { status: "processing" };
   });
@@ -161,15 +165,24 @@ export async function mediaRoutes(app: FastifyInstance) {
     if (!row) throw notFound("Media not found");
     if (row.owner_id !== request.user!.id && !["moderator", "admin"].includes(request.user!.role)) throw forbidden();
     if (!["failed", "rejected"].includes(row.privacy_status)) throw conflict("Only failed media can be retried");
-    await query("UPDATE media_assets SET privacy_status = 'processing', failure_code = NULL, updated_at = now() WHERE id = $1", [params.id]);
+    await query(
+      `UPDATE media_assets
+       SET privacy_status = 'processing',
+           failure_code = NULL,
+           processing_attempts = 0,
+           updated_at = now()
+       WHERE id = $1`,
+      [params.id]
+    );
     try {
       await enqueueMediaProcessing(params.id, `media-${params.id}-${Date.now()}`);
     } catch (error) {
+      // Keep the row recoverable instead of failing it; the watchdog retries it.
       await query(
-        "UPDATE media_assets SET privacy_status = 'failed', failure_code = 'QUEUE_UNAVAILABLE', updated_at = now() WHERE id = $1",
+        "UPDATE media_assets SET failure_code = 'QUEUE_UNAVAILABLE_PENDING_RECOVERY', updated_at = now() WHERE id = $1",
         [params.id]
       );
-      throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Retry later.");
+      throw new AppError(503, "QUEUE_UNAVAILABLE", "Media processing queue is unavailable. Processing will start automatically shortly.");
     }
     return { status: "processing" };
   });
@@ -246,6 +259,73 @@ export async function mediaRoutes(app: FastifyInstance) {
     }
 
     return { status: "ready", url: publicMediaUrl(publicKey), thumbnailUrl: media.thumbnail_object_key ? publicMediaUrl(thumbnailKey) : null };
+  });
+
+  app.post("/media/:id/privacy-reject", { preHandler: requireModerator }, async (request) => {
+    const params = z.object({ id: z.string().uuid() }).parse(request.params);
+    const input = moderationDecisionSchema.parse(request.body);
+
+    const { row, processedKey } = await transaction(async (client) => {
+      const result = await client.query<{
+        owner_id: string;
+        privacy_status: string;
+        processed_object_key: string | null;
+        thumbnail_object_key: string | null;
+      }>(
+        `SELECT owner_id, privacy_status, processed_object_key, thumbnail_object_key
+         FROM media_assets WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+        [params.id]
+      );
+      const row = result.rows[0];
+      if (!row) throw notFound("Media not found");
+      if (row.privacy_status !== "manual_review" || !row.processed_object_key) {
+        throw conflict("Media is not waiting for manual privacy approval");
+      }
+      const processedKey: string = row.processed_object_key;
+
+      await client.query(
+        `UPDATE media_assets
+         SET privacy_status = 'rejected',
+             processed_object_key = NULL,
+             thumbnail_object_key = NULL,
+             public_object_key = NULL,
+             public_thumbnail_object_key = NULL,
+             failure_code = $2,
+             delete_after = now() + interval '7 days',
+             updated_at = now()
+         WHERE id = $1`,
+        [params.id, `REJECTED: ${input.reasonCode}`.slice(0, 500)]
+      );
+      await recordAudit(client, {
+        actorId: request.user!.id,
+        action: "media.privacy_rejected",
+        resourceType: "media",
+        resourceId: params.id,
+        metadata: { reasonCode: input.reasonCode, notes: input.notes ?? null }
+      });
+      await notifyUser(client, {
+        userId: row.owner_id,
+        type: "media_privacy_rejected",
+        title: "照片未通过隐私复核",
+        body: `审核员拒绝原因：${input.reasonCode}${input.notes ? `。${input.notes}` : ""}。请重新上传或调整隐私框选后重试。`,
+        link: "/me/contributions"
+      });
+      return { row, processedKey };
+    });
+
+    // Rejecting keeps the asset out of the public bucket forever. The private
+    // processed derivatives are removed (the original is retained on the 7-day
+    // failed-media schedule in case the owner retries with new regions). Object
+    // deletion is best-effort after the DB commit; the deleted-object janitor
+    // cleans up anything left behind.
+    await Promise.allSettled([
+      deleteObject(config.S3_QUARANTINE_BUCKET, processedKey),
+      row.thumbnail_object_key ? deleteObject(config.S3_QUARANTINE_BUCKET, row.thumbnail_object_key) : Promise.resolve(),
+      deleteObject(config.S3_PUBLIC_BUCKET, `media/${params.id}.webp`),
+      deleteObject(config.S3_PUBLIC_BUCKET, `media/${params.id}.thumb.webp`)
+    ]);
+
+    return { status: "rejected" };
   });
 
   app.delete("/media/:id", { preHandler: requireAuth }, async (request) => {
